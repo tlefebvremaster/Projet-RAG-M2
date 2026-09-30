@@ -1,0 +1,336 @@
+{
+  "id": "7c701d50-b052-449b-95df-9c5835f4d0aa",
+  "name": "Airbnb - Suivi Prix & Disponibilité",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Suivi Prix & Disponibilité\n\nVoir ARCHITECTURE.md pour le détail complet. Résumé :\n- 1 exécution/jour\n- Traite les biens par paquets de 3 (nœud \"Loop Over Items\") pour rester sous la limite de 60s par tâche de n8n — important sur n8n.cloud où ce délai n'est pas modifiable\n- Pour chaque bien, teste 3 fenêtres de dates (base ± flex_days) et retient la moins chère disponible\n- Alerte Slack sur changement de prix/dispo, et sur 3 échecs consécutifs (bien à vérifier manuellement)\n\n**Avant d'activer :**\n1. Google Sheet avec onglets `Tracked` et `History` (voir tracked-listings-template.csv).\n2. Connecte tes identifiants Google Sheets sur les 3 nœuds Google Sheets, remplace `REMPLACE_PAR_TON_ID_GOOGLE_SHEET`.\n3. Connecte ton compte Slack sur le nœud Slack, choisis le channel.\n4. Vérifie que la sortie \"loop\" de \"Loop Over Items\" part bien vers \"Récupérer Prix & Dispo\" (survole les 2 sorties du nœud pour voir leurs noms — si ton import les a inversées, redrague la connexion vers la bonne).\n5. Active le workflow.\n\n⚠️ Utilise l'API interne (non-officielle) d'Airbnb — gratuite mais susceptible d'évoluer sans préavis (voir README, section maintenance).",
+        "height": 460,
+        "width": 440
+      },
+      "id": "sticky-1",
+      "name": "Notes de configuration",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-660, -260]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "schedule-1",
+      "name": "1x par jour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-140, 0]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REMPLACE_PAR_TON_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Tracked"
+        },
+        "options": {}
+      },
+      "id": "sheets-read-1",
+      "name": "Lire Biens Suivis",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [100, 0],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "batchSize": 3,
+        "options": {}
+      },
+      "id": "loop-1",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Récupère le prix et la disponibilité de chaque bien suivi, en testant\n// jusqu'à 3 fenêtres de dates (base, base-flex_days, base+flex_days) et en\n// retenant la moins chère parmi celles disponibles.\n// Utilise l'endpoint GraphQL public d'Airbnb (StaysPdpBookItQuery) avec la\n// clé API publique utilisée par le site lui-même (stable, non secrète).\nconst AIRBNB_API_KEY = 'd306zoyjsyarp7ifhu67rjxn52tv0t20';\nconst QUERY_HASH = '45cc0ada54da798665ac40417178a67be1378ca94275d37a2eca61ac1fb2cf7d';\n\nfunction addDays(dateStr, days) {\n  const d = new Date(dateStr + 'T00:00:00Z');\n  d.setUTCDate(d.getUTCDate() + days);\n  return d.toISOString().slice(0, 10);\n}\n\nasync function fetchWindow(listingIdB64, checkIn, checkOut, adults) {\n  const variables = {\n    id: listingIdB64,\n    dateRange: { startDate: checkIn, endDate: checkOut },\n    guestCounts: { numberOfAdults: adults },\n    includePdpMigrationBookItCalendarSheetFragment: true,\n    includePdpMigrationBookItFloatingFooterFragment: true,\n    includePdpMigrationBookItNavFragment: true,\n    includePdpMigrationBookItSidebarFragment: true,\n    includeOverviewMerchandisingTipsFragment: true,\n    includeStaysPdpPriceHeatmapFragment: false,\n    priceHeatmapDateRange: { startDate: checkIn, endDate: checkOut },\n    p3ImpressionId: 'p3_n8n_monitor',\n    selectedCancellationPolicyId: null,\n    causeId: null,\n    selectedGuestOptionId: null\n  };\n  const extensions = { persistedQuery: { version: 1, sha256Hash: QUERY_HASH } };\n  const url = `https://www.airbnb.com/api/v3/StaysPdpBookItQuery/${QUERY_HASH}?operationName=StaysPdpBookItQuery&locale=fr&currency=EUR&variables=${encodeURIComponent(JSON.stringify(variables))}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;\n\n  const response = await this.helpers.httpRequest({\n    method: 'GET',\n    url,\n    headers: {\n      'X-Airbnb-Api-Key': AIRBNB_API_KEY,\n      'Accept': 'application/json',\n      'Accept-Language': 'fr-FR,fr;q=0.9',\n      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'\n    },\n    json: true\n  });\n  return response?.data?.node?.pdpPresentation?.bookIt || null;\n}\n\nconst results = [];\n\nfor (const inputItem of $input.all()) {\n  const d = inputItem.json;\n  const listingId = String(d.listing_id || '').trim();\n  const baseCheckIn = d.check_in;\n  const baseCheckOut = d.check_out;\n  const adults = Number(d.guests) || 2;\n  const flexDays = Number(d.flex_days) || 0;\n\n  if (!listingId || !baseCheckIn || !baseCheckOut) {\n    results.push({ json: { ...d, fetch_error: 'listing_id, check_in ou check_out manquant', checked_at: new Date().toISOString() } });\n    continue;\n  }\n\n  const listingIdB64 = Buffer.from(`DemandStayListing:${listingId}`).toString('base64');\n  const offsets = flexDays > 0 ? [-flexDays, 0, flexDays] : [0];\n\n  let best = null;\n  let lastError = null;\n\n  for (const offset of offsets) {\n    const checkIn = addDays(baseCheckIn, offset);\n    const checkOut = addDays(baseCheckOut, offset);\n\n    try {\n      const bookIt = await fetchWindow.call(this, listingIdB64, checkIn, checkOut, adults);\n      const isAvailable = bookIt?.availability?.isAvailable ?? false;\n      const priceFormatted = bookIt?.structuredDisplayPrice?.primaryLine?.price ?? null;\n      const priceNumeric = priceFormatted ? Number(priceFormatted.replace(/[^0-9]/g, '')) : null;\n\n      if (isAvailable && priceNumeric !== null) {\n        if (!best || !best.available || priceNumeric < best.price) {\n          best = { price: priceNumeric, priceFormatted, checkIn, checkOut, available: true };\n        }\n      } else if (!best) {\n        best = { price: null, priceFormatted: null, checkIn, checkOut, available: false, unavailabilityMessage: bookIt?.availability?.unavailabilityMessage ?? null };\n      }\n    } catch (e) {\n      lastError = e.message;\n    }\n\n    await new Promise((r) => setTimeout(r, 600));\n  }\n\n  results.push({\n    json: {\n      ...d,\n      current_price_eur: best ? best.price : null,\n      current_price_formatted: best ? best.priceFormatted : null,\n      current_available: best ? best.available : null,\n      matched_check_in: best ? best.checkIn : null,\n      matched_check_out: best ? best.checkOut : null,\n      unavailability_message: best ? (best.unavailabilityMessage || null) : null,\n      checked_at: new Date().toISOString(),\n      fetch_error: best ? null : lastError\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "code-fetch-1",
+      "name": "Récupérer Prix & Dispo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Compare le relevé actuel au dernier relevé connu, gère le compteur\n// d'échecs consécutifs, et prépare le texte du message Slack.\nconst ERROR_ALERT_THRESHOLD = 3;\nconst results = [];\n\nfor (const item of $input.all()) {\n  const d = item.json;\n  const hadError = !!d.fetch_error;\n\n  const lastPriceRaw = d.last_price_eur;\n  const lastPrice = (lastPriceRaw === '' || lastPriceRaw === undefined || lastPriceRaw === null) ? null : Number(lastPriceRaw);\n\n  const lastAvailableRaw = d.last_available;\n  const hasLastAvailable = !(lastAvailableRaw === '' || lastAvailableRaw === undefined || lastAvailableRaw === null);\n  const lastAvailable = hasLastAvailable ? (lastAvailableRaw === true || String(lastAvailableRaw).toLowerCase() === 'true') : null;\n\n  const currentPrice = d.current_price_eur;\n  const currentAvailable = d.current_available;\n\n  const priceChanged = !hadError && currentPrice !== null && currentPrice !== undefined && lastPrice !== null && currentPrice !== lastPrice;\n  const availabilityChanged = !hadError && currentAvailable !== null && currentAvailable !== undefined && hasLastAvailable && currentAvailable !== lastAvailable;\n\n  const prevConsecutiveErrors = Number(d.consecutive_errors) || 0;\n  const newConsecutiveErrors = hadError ? prevConsecutiveErrors + 1 : 0;\n  const errorAlertTriggered = hadError && newConsecutiveErrors === ERROR_ALERT_THRESHOLD;\n\n  let slackMessage = null;\n  if (errorAlertTriggered) {\n    slackMessage = `⚠️ *${d.name}*\\nÉchec de vérification ${newConsecutiveErrors} fois de suite — à vérifier manuellement.\\n🔗 ${d.url}`;\n  } else if (priceChanged || availabilityChanged) {\n    const lines = [`🔔 *${d.name}*`];\n    if (priceChanged) lines.push(`💰 Prix : ${lastPrice}€ → ${currentPrice}€`);\n    if (availabilityChanged) lines.push(`📅 Disponibilité : ${currentAvailable ? 'redevenu disponible ✅' : 'devenu indisponible ❌'}`);\n    lines.push(`📆 ${d.matched_check_in || d.check_in} → ${d.matched_check_out || d.check_out}`);\n    lines.push(`🔗 ${d.url}`);\n    slackMessage = lines.join('\\n');\n  }\n\n  results.push({\n    json: {\n      ...d,\n      price_changed: priceChanged,\n      availability_changed: availabilityChanged,\n      consecutive_errors: newConsecutiveErrors,\n      error_alert_triggered: errorAlertTriggered,\n      has_alert: !!slackMessage,\n      slack_message: slackMessage\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "code-compare-1",
+      "name": "Comparer & Préparer Alerte",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 0]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REMPLACE_PAR_TON_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "History"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "checked_at": "={{$json.checked_at}}",
+            "listing_id": "={{$json.listing_id}}",
+            "name": "={{$json.name}}",
+            "price_eur": "={{$json.current_price_eur}}",
+            "available": "={{$json.current_available}}",
+            "matched_check_in": "={{$json.matched_check_in}}",
+            "matched_check_out": "={{$json.matched_check_out}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "sheets-append-history-1",
+      "name": "Ajouter à l'Historique",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [940, 180],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-1",
+              "leftValue": "={{$json.has_alert}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-alert-1",
+      "name": "Alerte à Envoyer ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [940, -60]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "REMPLACE_PAR_TON_CHANNEL_SLACK",
+          "cachedResultName": "REMPLACE_PAR_TON_CHANNEL_SLACK"
+        },
+        "text": "={{$json.slack_message}}",
+        "otherOptions": {}
+      },
+      "id": "slack-alert-1",
+      "name": "Alerte Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1180, -160],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REMPLACE_PAR_TON_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Tracked"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "listing_id": "={{$json.listing_id}}",
+            "last_price_eur": "={{$json.fetch_error ? $json.last_price_eur : $json.current_price_eur}}",
+            "last_available": "={{$json.fetch_error ? $json.last_available : $json.current_available}}",
+            "last_checked": "={{$json.checked_at}}",
+            "consecutive_errors": "={{$json.consecutive_errors}}"
+          },
+          "matchingColumns": [
+            "listing_id"
+          ]
+        },
+        "options": {}
+      },
+      "id": "sheets-update-1",
+      "name": "Mettre à Jour Suivi",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1420, -60],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "1x par jour": {
+      "main": [
+        [
+          {
+            "node": "Lire Biens Suivis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lire Biens Suivis": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Récupérer Prix & Dispo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Récupérer Prix & Dispo": {
+      "main": [
+        [
+          {
+            "node": "Comparer & Préparer Alerte",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comparer & Préparer Alerte": {
+      "main": [
+        [
+          {
+            "node": "Alerte à Envoyer ?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Ajouter à l'Historique",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerte à Envoyer ?": {
+      "main": [
+        [
+          {
+            "node": "Alerte Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mettre à Jour Suivi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerte Slack": {
+      "main": [
+        [
+          {
+            "node": "Mettre à Jour Suivi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mettre à Jour Suivi": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

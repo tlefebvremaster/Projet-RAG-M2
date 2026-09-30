@@ -1,0 +1,16 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Secrets / credentials (ne jamais committer de clés n8n ou tokens)
+.env
+.env.*
+*credentials*.json
+secrets/
+
+# Fichiers temporaires Excel
+~$*.xlsx

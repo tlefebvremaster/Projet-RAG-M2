@@ -1,0 +1,293 @@
+{
+  "id": "33d38334-9015-4c71-8f61-0e14b6b75aa6",
+  "name": "Airbnb - Nouvelles Annonces",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Nouvelles Annonces\n\nVoir ARCHITECTURE.md pour le détail complet. Résumé :\n- 1 exécution/jour\n- Teste 3 fenêtres de dates (base ± flex_days) × N pages de résultats\n- Filtres natifs Airbnb : logement entier + type Maison + amenité Piscine\n- Filtre strict sur le budget TOTAL après coup (le filtre Airbnb est par nuit)\n- Déduplique par annonce (garde la moins chère), compare à l'onglet Seen, alerte Slack sur toute nouveauté\n\n**Avant d'activer :**\n1. Dans le nœud **Critères de Recherche**, ajuste lieu/dates/budget/pages si besoin.\n2. Google Sheet avec onglet `Seen` (listing_id, name, price_eur, url, first_seen).\n3. Connecte Google Sheets + Slack, remplace `REMPLACE_PAR_TON_ID_GOOGLE_SHEET` et le channel Slack.\n4. Active le workflow.",
+        "height": 480,
+        "width": 460
+      },
+      "id": "sticky-2",
+      "name": "Notes de configuration",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-700, -300]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "schedule-2",
+      "name": "1x par jour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-140, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "location_slug",
+              "type": "string",
+              "value": "Cannes--France"
+            },
+            {
+              "id": "a2",
+              "name": "check_in",
+              "type": "string",
+              "value": "2027-05-13"
+            },
+            {
+              "id": "a3",
+              "name": "check_out",
+              "type": "string",
+              "value": "2027-05-20"
+            },
+            {
+              "id": "a4",
+              "name": "flex_days",
+              "type": "number",
+              "value": 2
+            },
+            {
+              "id": "a5",
+              "name": "guests",
+              "type": "number",
+              "value": 2
+            },
+            {
+              "id": "a6",
+              "name": "price_min_total",
+              "type": "number",
+              "value": 10000
+            },
+            {
+              "id": "a7",
+              "name": "price_max_total",
+              "type": "number",
+              "value": 25000
+            },
+            {
+              "id": "a8",
+              "name": "property_type_id",
+              "type": "number",
+              "value": 1
+            },
+            {
+              "id": "a9",
+              "name": "pool_amenity_id",
+              "type": "number",
+              "value": 7
+            },
+            {
+              "id": "a10",
+              "name": "pages",
+              "type": "number",
+              "value": 2
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-criteria-1",
+      "name": "Critères de Recherche",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [100, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Interroge la page de résultats de recherche Airbnb (HTML public, sans clé API)\n// sur 3 fenêtres de dates (base ± flex_days) et N pages, avec filtres natifs\n// Airbnb (logement entier + type Maison + amenité Piscine).\n// Filtre ensuite strictement sur le budget TOTAL (le filtre Airbnb est par nuit).\nconst criteria = $input.first().json;\nconst location = encodeURIComponent(criteria.location_slug);\nconst baseCheckIn = criteria.check_in;\nconst baseCheckOut = criteria.check_out;\nconst adults = criteria.guests;\nconst priceMinTotal = Number(criteria.price_min_total);\nconst priceMaxTotal = Number(criteria.price_max_total);\nconst flexDays = Number(criteria.flex_days) || 0;\nconst pages = Number(criteria.pages) || 1;\nconst propertyTypeId = criteria.property_type_id || 1;\nconst poolAmenityId = criteria.pool_amenity_id || 7;\nconst pageSize = 18;\n\nfunction addDays(dateStr, days) {\n  const d = new Date(dateStr + 'T00:00:00Z');\n  d.setUTCDate(d.getUTCDate() + days);\n  return d.toISOString().slice(0, 10);\n}\n\nconst nights = Math.max(1, Math.round((new Date(baseCheckOut) - new Date(baseCheckIn)) / 86400000));\nconst priceMinNight = Math.max(0, Math.floor(priceMinTotal / nights));\nconst priceMaxNight = Math.ceil(priceMaxTotal / nights);\n\nconst offsets = flexDays > 0 ? [-flexDays, 0, flexDays] : [0];\nconst byListing = new Map();\n\nfor (const offset of offsets) {\n  const checkIn = addDays(baseCheckIn, offset);\n  const checkOut = addDays(baseCheckOut, offset);\n\n  for (let page = 0; page < pages; page++) {\n    const itemsOffset = page * pageSize;\n    const url = `https://www.airbnb.com/s/${location}/homes?checkin=${checkIn}&checkout=${checkOut}&adults=${adults}&price_min=${priceMinNight}&price_max=${priceMaxNight}&room_types%5B%5D=Entire%20home%2Fapt&l2_property_type_ids%5B%5D=${propertyTypeId}&amenities%5B%5D=${poolAmenityId}&items_offset=${itemsOffset}`;\n\n    let html;\n    try {\n      html = await this.helpers.httpRequest({\n        method: 'GET',\n        url,\n        headers: {\n          'Accept-Language': 'fr-FR,fr;q=0.9',\n          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'\n        }\n      });\n    } catch (e) {\n      continue;\n    }\n\n    const match = html.match(/<script[^>]*data-deferred-state[^>]*>([\\s\\S]*?)<\\/script>/);\n    if (!match) continue;\n\n    let data;\n    try {\n      data = JSON.parse(match[1]);\n    } catch (e) {\n      continue;\n    }\n\n    const results = data?.niobeClientData?.[0]?.[1]?.data?.presentation?.staysSearch?.results?.searchResults || [];\n\n    for (const r of results) {\n      const b64 = r.demandStayListing?.id;\n      if (!b64) continue;\n\n      let numericId;\n      try {\n        numericId = Buffer.from(b64, 'base64').toString('utf8').replace('DemandStayListing:', '');\n      } catch (e) {\n        continue;\n      }\n      if (!numericId) continue;\n\n      const priceFormatted = r.structuredDisplayPrice?.primaryLine?.price || null;\n      const priceNumeric = priceFormatted ? Number(priceFormatted.replace(/[^0-9]/g, '')) : null;\n\n      // Garde-fou : le filtre URL est par nuit (approximatif), on impose ici le budget TOTAL exact\n      if (priceNumeric === null || priceNumeric < priceMinTotal || priceNumeric > priceMaxTotal) continue;\n\n      const existing = byListing.get(numericId);\n      if (!existing || priceNumeric < existing.price_eur) {\n        const name = r.nameLocalized?.localizedStringWithTranslationPreference || r.title || 'Sans titre';\n        byListing.set(numericId, {\n          listing_id: numericId,\n          name,\n          price_eur: priceNumeric,\n          price_formatted: priceFormatted,\n          url: `https://www.airbnb.com/rooms/${numericId}`,\n          check_in: checkIn,\n          check_out: checkOut\n        });\n      }\n    }\n\n    // Petite pause entre chaque appel pour rester discret vis-à-vis d'Airbnb\n    await new Promise((res) => setTimeout(res, 1500));\n  }\n}\n\nreturn Array.from(byListing.values()).map((v) => ({ json: v }));"
+      },
+      "id": "code-search-1",
+      "name": "Chercher Nouvelles Annonces",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 0]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REMPLACE_PAR_TON_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Seen"
+        },
+        "options": {}
+      },
+      "id": "sheets-read-seen-1",
+      "name": "Lire Annonces Déjà Vues",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [580, 0],
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Compare les annonces trouvées à celles déjà notifiées (onglet Seen),\n// ne garde que les nouvelles, et prépare le texte du message Slack.\nconst seenRows = $input.all()\n  .map((i) => i.json.listing_id)\n  .filter((v) => v !== undefined && v !== null && v !== '')\n  .map((v) => String(v));\nconst seenSet = new Set(seenRows);\n\nconst allFound = $('Chercher Nouvelles Annonces').all();\nconst newOnes = allFound.filter((item) => !seenSet.has(String(item.json.listing_id)));\n\nreturn newOnes.map((item) => {\n  const d = item.json;\n  const slackMessage = [\n    `🆕 *${d.name}*`,\n    `💰 ${d.price_formatted}`,\n    `📆 ${d.check_in} → ${d.check_out}`,\n    `🔗 ${d.url}`\n  ].join('\\n');\n\n  return {\n    json: {\n      ...d,\n      first_seen: new Date().toISOString(),\n      slack_message: slackMessage\n    }\n  };\n});"
+      },
+      "id": "code-filter-new-1",
+      "name": "Filtrer Nouvelles Annonces",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [820, 0]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "REMPLACE_PAR_TON_CHANNEL_SLACK",
+          "cachedResultName": "REMPLACE_PAR_TON_CHANNEL_SLACK"
+        },
+        "text": "={{$json.slack_message}}",
+        "otherOptions": {}
+      },
+      "id": "slack-new-1",
+      "name": "Alerte Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1060, 0],
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REMPLACE_PAR_TON_ID_GOOGLE_SHEET"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Seen"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "listing_id": "={{$json.listing_id}}",
+            "name": "={{$json.name}}",
+            "price_eur": "={{$json.price_eur}}",
+            "url": "={{$json.url}}",
+            "first_seen": "={{$json.first_seen}}"
+          }
+        },
+        "options": {}
+      },
+      "id": "sheets-append-seen-1",
+      "name": "Enregistrer comme Vue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1300, 0],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "1x par jour": {
+      "main": [
+        [
+          {
+            "node": "Critères de Recherche",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Critères de Recherche": {
+      "main": [
+        [
+          {
+            "node": "Chercher Nouvelles Annonces",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chercher Nouvelles Annonces": {
+      "main": [
+        [
+          {
+            "node": "Lire Annonces Déjà Vues",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lire Annonces Déjà Vues": {
+      "main": [
+        [
+          {
+            "node": "Filtrer Nouvelles Annonces",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filtrer Nouvelles Annonces": {
+      "main": [
+        [
+          {
+            "node": "Alerte Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerte Slack": {
+      "main": [
+        [
+          {
+            "node": "Enregistrer comme Vue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
